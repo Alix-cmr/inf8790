@@ -1,0 +1,174 @@
+1. Chargement des données en utilisant Neo4J uniquement (books.csv, user.csv, rating.csv)
+
+LOAD CSV WITH HEADERS FROM 'file:///Books_subset.csv' AS row
+WITH row
+WHERE row.`Book-Title` IS NOT NULL AND row.`Book-Author` IS NOT NULL
+MERGE (b:Book {ISBN: row.ISBN})
+SET b.title = row.`Book-Title`,
+    b.author = row.`Book-Author`,
+    b.year = toInteger(row.`Year-Of-Publication`),
+    b.publisher = row.Publisher;
+
+
+
+LOAD CSV WITH HEADERS FROM 'file:///Users_cleaned.csv' AS row
+MERGE (u:user {userId: row.`User-ID`})
+SET u.userAge = row.Age,
+    u.userCity = row.City,
+    u.userState = row.State,
+    u.userCountry = row.Country;
+
+
+
+LOAD CSV WITH HEADERS FROM 'file:///Ratings_subset.csv' AS row
+WITH row
+WHERE row.`User-ID` IS NOT NULL AND row.`User-ID` <> ""
+MERGE (u:user {userId: toInteger(row.`User-ID`)});
+
+
+
+2. Recommandation
+
+Requêtes pour la recommandation
+
+2.1. Représenter les évaluations des utilisateurs:
+Cette requête retourne une liste de livres évalués et leurs notes pour chaque utilisateur.
+
+MATCH (u:user)-[r:RATED]->(b:Book)
+RETURN u.userId AS UserId, COLLECT({ISBN: b.ISBN, rating: r.rating}) AS Ratings
+LIMIT 10;
+
+
+2.2. Calculer la similarité cosinus entre utilisateurs:
+Nous utilisons l'algorithme de similarité cosinus pour calculer les scores entre utilisateurs partageant des livres évalués. On choisit l'utilisateur cible en spécifiant son userID (243) et on essaie de trouver les utilisateurs qui lui sont similaires.
+
+MATCH (u1:user)-[r1:RATED]->(b:Book)<-[r2:RATED]-(u2:user)
+WHERE u1.userId =2435 AND u1 <> u2
+WITH
+    u1,
+    u2,
+    COLLECT(r1.rating * r2.rating) AS productRatings,
+    COLLECT(r1.rating) AS ratings1,
+    COLLECT(r2.rating) AS ratings2
+WITH
+    u1,
+    u2,
+    REDUCE(sum = 0, x IN productRatings | sum + x) AS dotProduct,
+    SQRT(REDUCE(sum = 0, x IN ratings1 | sum + x^2)) AS magnitude1,
+    SQRT(REDUCE(sum = 0, x IN ratings2 | sum + x^2)) AS magnitude2
+WITH
+    u1,
+    u2,
+    CASE WHEN magnitude1 * magnitude2 = 0 THEN 0 ELSE dotProduct / (magnitude1 * magnitude2) END AS similarity
+RETURN u1.userId AS TargetUser, u2.userId AS SimilarUser, similarity
+ORDER BY similarity DESC
+LIMIT 5;
+
+* Explication:
+  * Trouve les utilisateurs ayant évalué les mêmes livres que l'utilisateur cible.
+  * Calcule:
+    * Produit scalaire des évaluations communes.
+    * Magnitudes des vecteurs d'évaluations.
+    * Similarité cosinus en combinant ces valeurs.
+
+
+2.3. Recommander des livres des utilisateurs similaires
+Après avoir trouvé les utilisateurs similaires, on recommande leurs livres bien notés mais non évalués par l'utilisateur cible.
+
+MATCH (u1:user {userId: 243})-[:RATED]->(b:Book)
+WITH COLLECT(b.ISBN) AS alreadyRated, u1
+MATCH (u2:user)-[r:RATED]->(b2:Book)
+WHERE NOT b2.ISBN IN alreadyRated AND u2 <> u1
+WITH u2, b2, r.rating AS rating, u1
+MATCH (u1)-[r1:RATED]->(b:Book)<-[r2:RATED]-(u2)
+WITH b2, AVG(rating) AS AvgRating, COUNT(*) AS SimilarityScore
+WHERE AvgRating > 7
+ORDER BY SimilarityScore DESC, AvgRating DESC
+RETURN b2.title AS RecommendedBook, b2.author AS Author, AvgRating, SimilarityScore
+LIMIT 10;
+
+* Explication:
+
+
+  * Étape 1 : Trouver les livres déjà évalués par l'utilisateur cible.
+
+    MATCH (u1:user {userId: 243})-[:RATED]->(b:Book)
+    WITH COLLECT(b.ISBN) AS alreadyRated, u1
+
+  * MATCH (u1:user {userId: 243})-[:RATED]->(b:Book) :
+    * Identifie l'utilisateur cible (u1) avec userId = 243.
+    * Trouve tous les livres (b) que cet utilisateur a déjà notés via la relation RATED.
+  * WITH COLLECT(b.ISBN) AS alreadyRated :
+    * Regroupe les ISBN des livres déjà évalués dans une liste alreadyRated.
+    * Cette liste sera utilisée plus tard pour exclure ces livres des recommandations.
+      
+
+
+*  Étape 2 : Trouver les livres évalués par d'autres utilisateurs.
+
+   MATCH (u2:user)-[r:RATED]->(b2:Book)
+   WHERE NOT b2.ISBN IN alreadyRated AND u2 <> u1
+
+  * MATCH (u2:user)-[r:RATED]->(b2:Book) :
+    * Trouve tous les autres utilisateurs (u2) et les livres (b2) qu'ils ont évalués.
+  * WHERE NOT b2.ISBN IN alreadyRated AND u2 <> u1 :
+    * Exclut les livres déjà évalués par l'utilisateur cible (b2.ISBN NOT IN alreadyRated).
+    * Ignore l'utilisateur cible lui-même (u2 <> u1).
+
+
+*  Étape 3 : Préparer les évaluations des utilisateurs similaires.
+
+   WITH u2, b2, r.rating AS rating, u1
+
+  * WITH:
+    * Passe les résultats intermédiaires à l'étape suivante :
+      * u2 : Utilisateurs similaires.
+      * b2 : Livres évalués par ces utilisateurs.
+      * r.rating : Notes données aux livres.
+        
+
+
+* Étape 4 : Identifier les relations avec l'utilisateur cible.
+
+  MATCH (u1)-[r1:RATED]->(b:Book)<-[r2:RATED]-(u2)
+
+  * MATCH (u1)-[r1:RATED]->(b:Book)<-[r2:RATED]-(u2) :
+    * Trouve les livres évalués en commun par l'utilisateur cible (u1) et les utilisateurs similaires (u2).
+    * Cette étape permet de mesurer la similarité entre les utilisateurs.
+
+
+
+* Étape 5 : Calculer les scores pour chaque livre.
+
+  WITH b2, AVG(rating) AS AvgRating, COUNT(*) AS SimilarityScore
+
+  * AVG(rating) :
+    * Calcule la moyenne des notes données par les utilisateurs similaires pour chaque livre (b2).
+    * Donne une indication de la qualité des livres selon les utilisateurs similaires.
+  * COUNT(*) :
+    * Compte le nombre d'utilisateurs similaires ayant évalué chaque livre.
+    * Ce score (SimilarityScore) mesure la pertinence du livre en fonction de sa popularité parmi les utilisateurs similaires.
+
+
+
+* Étape 6 : Filtrer les livres avec des meilleures notes.
+
+  WHERE AvgRating > 7
+
+  * WHERE AvgRating > 7:
+    * Exclut les livres pour lesquels la moyenne des notes est inférieure à 7 car on considère qu'un livre est mieux noté si sa note moyenne est supérieure à 7. On rappelle que la note (rating) est comprise entre 0 et 10.
+
+
+
+* Étape 7 : Trier et limiter les résultats.
+
+  ORDER BY SimilarityScore DESC, AvgRating DESC
+  RETURN b2.title AS RecommendedBook, b2.author AS Author, AvgRating, SimilarityScore  LIMIT 10;
+
+  * ORDER BY SimilarityScore DESC, AvgRating DESC :
+    * Trie les résultats pour privilégier les livres:
+      1. Évalués par le plus grand nombre d'utilisateurs similaires (SimilarityScore élevé).
+      2. Ayant une moyenne de notes élevée (AvgRating élevé).
+    * LIMIT 10 :
+      * Limite les résultats aux 10 livres les plus recommandés.
+   
